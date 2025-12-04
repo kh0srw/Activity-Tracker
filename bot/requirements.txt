@@ -1,0 +1,3 @@
+# Telegram Bot Dependencies (no telegram library - direct API)
+httpx>=0.25.0
+python-dotenv>=1.0.0

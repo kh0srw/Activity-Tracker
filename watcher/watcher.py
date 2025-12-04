@@ -1,6 +1,6 @@
 """
-Activity Tracker Pro - Production Watcher
-Intelligent categorization with Primary/Secondary/Idle detection
+Activity Tracker - Simple Raw Window Tracker
+Tracks ALL active windows without any filtering or categorization
 """
 
 import os
@@ -9,23 +9,23 @@ import time
 import threading
 import logging
 import sqlite3
-from datetime import datetime, timedelta
-from pathlib import Path
-from urllib.parse import urlparse
-import ctypes
+from datetime import datetime
+from queue import Queue, Empty
 
 try:
-    import winsound
-    import keyboard
+    import win32gui
+    import win32process
     import psutil
-    import pygetwindow as gw
+    from pynput import keyboard as pynput_keyboard
     import pystray
     from pystray import MenuItem as item
     from PIL import Image, ImageDraw
+    import winsound
     WINDOWS_FEATURES = True
 except ImportError:
     WINDOWS_FEATURES = False
-    print("Warning: Windows-specific features unavailable (running in Docker?)")
+    print("Error: Windows features required. Install: pip install pywin32 psutil pynput pystray pillow")
+    sys.exit(1)
 
 import config
 
@@ -36,75 +36,239 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     encoding="utf-8"
 )
-
 console = logging.StreamHandler()
 console.setLevel(logging.INFO)
 logging.getLogger().addHandler(console)
 
 
-class ActivityWatcher:
+class HotkeyManager:
+    """
+    Dedicated hotkey manager running on its own thread.
+    Uses a command queue to communicate with the main watcher.
+    """
+    
+    def __init__(self, command_queue: Queue):
+        self.command_queue = command_queue
+        self.listener = None
+        self.thread = None
+        self.running = False
+    
+    def start(self):
+        """Start the hotkey listener on a dedicated thread"""
+        self.running = True
+        self.thread = threading.Thread(target=self._run_listener, daemon=True, name="HotkeyThread")
+        self.thread.start()
+        logging.info("Hotkey listener started on dedicated thread")
+    
+    def stop(self):
+        """Stop the hotkey listener"""
+        self.running = False
+        if self.listener:
+            self.listener.stop()
+    
+    def _run_listener(self):
+        """Run the keyboard listener (blocks on this thread)"""
+        try:
+            self.listener = pynput_keyboard.GlobalHotKeys({
+                '<ctrl>+<alt>+<shift>+p': self._on_toggle_pause,
+            })
+            self.listener.start()
+            
+            # Keep thread alive while running
+            while self.running:
+                time.sleep(0.1)
+                
+        except Exception as e:
+            logging.error(f"Hotkey listener error: {e}")
+    
+    def _on_toggle_pause(self):
+        """Handle toggle pause hotkey - just queue the command"""
+        try:
+            self.command_queue.put_nowait("TOGGLE_PAUSE")
+        except Exception as e:
+            logging.error(f"Failed to queue command: {e}")
+
+
+class DatabaseWriter:
+    """
+    Non-blocking database writer using a separate thread.
+    Prevents DB operations from blocking the main loop.
+    """
+    
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.write_queue = Queue()
+        self.thread = None
+        self.running = False
+    
+    def start(self):
+        """Start the database writer thread"""
+        self.running = True
+        self.thread = threading.Thread(target=self._process_writes, daemon=True, name="DBWriterThread")
+        self.thread.start()
+        logging.info("Database writer thread started")
+    
+    def stop(self):
+        """Stop the writer and flush remaining items"""
+        self.running = False
+        # Process remaining items
+        while not self.write_queue.empty():
+            try:
+                item = self.write_queue.get_nowait()
+                self._execute_write(item)
+            except Empty:
+                break
+    
+    def queue_activity(self, timestamp, process_name, window_title, duration_seconds):
+        """Queue an activity record for writing"""
+        self.write_queue.put({
+            'type': 'activity',
+            'timestamp': timestamp,
+            'process_name': process_name,
+            'window_title': window_title,
+            'duration_seconds': duration_seconds
+        })
+    
+    def queue_break(self, start_time, end_time, duration_seconds):
+        """Queue a break record for writing"""
+        self.write_queue.put({
+            'type': 'break',
+            'start_time': start_time,
+            'end_time': end_time,
+            'duration_seconds': duration_seconds
+        })
+    
+    def queue_event(self, event_type, details=None):
+        """Queue a system event for writing"""
+        self.write_queue.put({
+            'type': 'event',
+            'event_type': event_type,
+            'timestamp': datetime.now().isoformat(),
+            'details': details
+        })
+    
+    def _process_writes(self):
+        """Process write queue continuously"""
+        while self.running:
+            try:
+                item = self.write_queue.get(timeout=1.0)
+                self._execute_write(item)
+            except Empty:
+                continue
+            except Exception as e:
+                logging.error(f"DB write error: {e}")
+    
+    def _execute_write(self, item):
+        """Execute a single write operation"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            
+            if item['type'] == 'activity':
+                c.execute("""
+                    INSERT INTO activity_log (timestamp, process_name, window_title, duration_seconds)
+                    VALUES (?, ?, ?, ?)
+                """, (
+                    item['timestamp'],
+                    item['process_name'],
+                    item['window_title'],
+                    item['duration_seconds']
+                ))
+            
+            elif item['type'] == 'break':
+                c.execute("""
+                    INSERT INTO breaks (start_time, end_time, duration_seconds)
+                    VALUES (?, ?, ?)
+                """, (
+                    item['start_time'],
+                    item['end_time'],
+                    item['duration_seconds']
+                ))
+            
+            elif item['type'] == 'event':
+                c.execute("""
+                    INSERT INTO system_events (event_type, timestamp, details)
+                    VALUES (?, ?, ?)
+                """, (
+                    item['event_type'],
+                    item['timestamp'],
+                    item['details']
+                ))
+            
+            conn.commit()
+            conn.close()
+            
+        except Exception as e:
+            logging.error(f"DB execute error: {e}")
+
+
+class SimpleActivityWatcher:
+    """
+    Simple activity watcher - tracks ALL windows without filtering.
+    No categorization, no productivity scoring, just raw data.
+    """
+    
     def __init__(self):
         self.db_path = config.DB_PATH
         self.monitoring = True
-        self.is_idle = False
         self.is_paused = False
         
-        self.idle_start = None
-        self.current_session = None
+        # Current tracking state
+        self.current_process = None
+        self.current_window = None
+        self.current_start = None
         
-        self.buffer = []
-        self.last_flush = time.time()
-        self.last_activity = time.time()
+        # Pause tracking
+        self.pause_start = None
+        
+        # Command queue for hotkey communication
+        self.command_queue = Queue()
+        
+        # Components
+        self.hotkey_manager = HotkeyManager(self.command_queue)
+        self.db_writer = DatabaseWriter(self.db_path)
         
         self.icon = None
+        self.polling_thread = None
+        self.command_thread = None
         
+        # Initialize
         self.init_db()
-        self.setup_hotkeys()
-        self.log_system_event("SYSTEM_STARTUP")
         
         logging.info("=" * 60)
-        logging.info("Activity Watcher STARTED")
+        logging.info("Activity Tracker - RAW MODE (No Filtering)")
         logging.info(f"Database: {self.db_path}")
-        logging.info(f"Flush Interval: {config.FLUSH_INTERVAL}s")
+        logging.info("Tracking: ALL windows and processes")
+        logging.info("Hotkey: Ctrl+Alt+Shift+P to pause/resume")
         logging.info("=" * 60)
-
+    
     def init_db(self):
-        """Initialize SQLite database with optimized schema"""
+        """Initialize simplified database schema"""
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         
-        # Sessions table - the heart of tracking
+        # Activity log - raw tracking (no categories)
         c.execute("""
-            CREATE TABLE IF NOT EXISTS sessions (
+            CREATE TABLE IF NOT EXISTS activity_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                start_time TEXT NOT NULL,
-                end_time TEXT,
+                timestamp TEXT NOT NULL,
                 process_name TEXT NOT NULL,
-                process_display_name TEXT,
                 window_title TEXT,
-                category TEXT NOT NULL,
-                subcategory TEXT,
-                duration_seconds REAL NOT NULL,
-                foreground_seconds REAL NOT NULL,
-                keystroke_count INTEGER DEFAULT 0,
-                mouse_click_count INTEGER DEFAULT 0,
-                is_focus_session BOOLEAN DEFAULT 0,
-                productivity_score REAL DEFAULT 0
+                duration_seconds REAL NOT NULL
             )
         """)
         
-        # Idle periods
+        # Breaks - manual pauses only
         c.execute("""
-            CREATE TABLE IF NOT EXISTS idle_periods (
+            CREATE TABLE IF NOT EXISTS breaks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 start_time TEXT NOT NULL,
                 end_time TEXT,
-                duration_seconds REAL,
-                reason TEXT
+                duration_seconds REAL
             )
         """)
         
-        # System events
+        # System events for debugging
         c.execute("""
             CREATE TABLE IF NOT EXISTS system_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,475 +278,242 @@ class ActivityWatcher:
             )
         """)
         
-        # Create indexes for performance
-        c.execute("CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(start_time)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_sessions_category ON sessions(category)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_idle_start ON idle_periods(start_time)")
+        # Indexes for faster queries
+        c.execute("CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_log(timestamp)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_activity_process ON activity_log(process_name)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_breaks_start ON breaks(start_time)")
         
         conn.commit()
         conn.close()
-        logging.info("Database initialized successfully")
-
-    def setup_hotkeys(self):
-        """Setup keyboard shortcuts"""
-        if not WINDOWS_FEATURES:
-            logging.warning("Hotkeys unavailable - Windows features not loaded")
-            return
-            
-        try:
-            keyboard.add_hotkey(config.HOTKEY_IDLE_START, self.start_idle_mode)
-            keyboard.add_hotkey(config.HOTKEY_IDLE_END, self.end_idle_mode)
-            keyboard.add_hotkey(config.HOTKEY_TOGGLE_MONITORING, self.toggle_monitoring)
-            logging.info("Hotkeys registered successfully")
-        except Exception as e:
-            logging.error(f"Failed to register hotkeys: {e}")
-
+        logging.info("Database initialized (simplified schema)")
+    
     def beep(self, freq=1000, dur=200):
         """Audio feedback"""
-        if WINDOWS_FEATURES:
-            try:
-                winsound.Beep(freq, dur)
-            except:
-                pass
-
-    def start_idle_mode(self):
-        """Manual idle mode activation"""
-        if not self.is_idle:
-            self.flush_buffer(force=True)
-            self.is_idle = True
-            self.idle_start = datetime.now()
-            self.beep(800, 300)
-            self.update_icon()
-            self.log_system_event("IDLE_MODE_MANUAL_START")
-            logging.info("🔴 IDLE MODE: Manual activation")
-
-    def end_idle_mode(self):
-        """End idle mode"""
-        if self.is_idle:
-            duration = (datetime.now() - self.idle_start).total_seconds()
-            self.log_idle_period(
-                self.idle_start,
-                datetime.now(),
-                duration,
-                "manual"
-            )
-            self.is_idle = False
-            self.idle_start = None
-            self.last_activity = time.time()
-            self.beep(1500, 200)
-            self.update_icon()
-            self.log_system_event("IDLE_MODE_MANUAL_END")
-            logging.info(f"🟢 ACTIVE MODE: Resumed (idle duration: {duration:.0f}s)")
-
-    def toggle_monitoring(self):
-        """Pause/Resume monitoring"""
-        self.is_paused = not self.is_paused
-        if self.is_paused:
-            self.flush_buffer(force=True)
-            self.log_system_event("MONITORING_PAUSED")
-            logging.info("⏸️  MONITORING PAUSED")
-        else:
-            self.last_activity = time.time()
-            self.log_system_event("MONITORING_RESUMED")
-            logging.info("▶️  MONITORING RESUMED")
-        self.beep(1200, 150)
-        self.update_icon()
-
-    def log_system_event(self, event_type, details=None):
-        """Log system events"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            c.execute(
-                "INSERT INTO system_events (event_type, timestamp, details) VALUES (?, ?, ?)",
-                (event_type, datetime.now().isoformat(), details)
-            )
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            logging.error(f"Failed to log system event: {e}")
-
-    def log_idle_period(self, start, end, duration, reason):
-        """Log idle period to database"""
+            winsound.Beep(freq, dur)
+        except:
+            pass
+    
+    def toggle_pause(self):
+        """Toggle pause state with audio and visual feedback"""
         try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            c.execute(
-                """INSERT INTO idle_periods 
-                   (start_time, end_time, duration_seconds, reason) 
-                   VALUES (?, ?, ?, ?)""",
-                (start.isoformat(), end.isoformat(), duration, reason)
-            )
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            logging.error(f"Failed to log idle period: {e}")
-
-    def get_foreground_app(self):
-        """
-        Get currently active window and process using reliable PID lookup via Windows API.
-        This fixes the flawed string matching logic.
-        """
-        if not WINDOWS_FEATURES:
-            return None, None, None
-            
-        try:
-            win = gw.getActiveWindow()
-            if not win or not win.title.strip():
-                return None, None, None
+            if self.is_paused:
+                # === RESUME TRACKING ===
+                if self.pause_start:
+                    duration = (datetime.now() - self.pause_start).total_seconds()
+                    self.db_writer.queue_break(
+                        self.pause_start.isoformat(),
+                        datetime.now().isoformat(),
+                        duration
+                    )
+                    logging.info(f"Break saved: {duration:.0f} seconds")
                 
-            title = win.title.strip()
-            
-            # 1. Get the Window Handle (hWnd) from pygetwindow object
-            # We access the internal handle attribute
-            hWnd = win._hWnd
-            
-            # 2. Use ctypes to call GetWindowThreadProcessId (Windows API)
-            user32 = ctypes.windll.user32
-            pid = ctypes.c_ulong()
-            # Get the PID of the process that owns the window handle
-            user32.GetWindowThreadProcessId(hWnd, ctypes.pointer(pid))
-            proc_id = pid.value
-            
-            # 3. Use psutil to get the process name from the reliable PID
-            if proc_id != 0:
-                try:
-                    proc = psutil.Process(proc_id)
-                    proc_name = proc.name()
-                    
-                    # Return the reliably found process name
-                    return proc_name, proc_name.lower(), title
-                except psutil.NoSuchProcess:
-                    # Process might have closed between getting PID and looking up
-                    logging.debug(f"Process with PID {proc_id} not found.")
-                    
-            return "Unknown.exe", "unknown.exe", title # Fallback if PID lookup fails
-            
-        except Exception as e:
-            # Catch errors related to pygetwindow or ctypes failure
-            logging.debug(f"Failed to get foreground app (PID lookup failed): {e}")
-            return None, None, None
-
-    def categorize_activity(self, process_name, process_lower, window_title):
-        """
-        Intelligent categorization system:
-        - PRIMARY_WORK: Main coding/development tools
-        - SECONDARY_WORK: Communication, music, support tools
-        - BROWSER_WORK: Browsers on work-related sites
-        - BROWSER_NONWORK: Browsers on entertainment sites
-        - IDLE: Everything else
-        """
-        if not process_name:
-            return "IDLE", None, 0
-            
-        # Check primary work apps (VSCode, Cursor, etc.)
-        if process_lower in config.PRIMARY_WORK_APPS:
-            display_name = config.PRIMARY_WORK_APPS[process_lower]
-            return "PRIMARY_WORK", display_name, 100
-            
-        # Check secondary work apps (Telegram, Spotify)
-        if process_lower in config.SECONDARY_WORK_APPS:
-            display_name = config.SECONDARY_WORK_APPS[process_lower]
-            return "SECONDARY_WORK", display_name, 60
-            
-        # Browser intelligence
-        if process_lower in config.BROWSER_APPS:
-            display_name = config.BROWSER_APPS[process_lower]
-            title_lower = window_title.lower()
-            
-            # Check for work domains
-            for domain in config.WORK_DOMAINS:
-                if domain in title_lower:
-                    return "BROWSER_WORK", f"{display_name} (Work)", 80
-                    
-            # Check for non-work domains
-            for domain in config.NON_WORK_DOMAINS:
-                if domain in title_lower:
-                    return "BROWSER_NONWORK", f"{display_name} (Leisure)", 20
-                    
-            # Default to work for unknown browser activity
-            return "BROWSER_WORK", display_name, 70
-            
-        # Everything else is idle
-        return "IDLE", process_name, 0
-
-    def flush_buffer(self, force=False):
-        """Flush activity buffer to database, ignoring samples with no detectable process name for categorization."""
-        if not self.buffer or self.is_idle or self.is_paused:
-            self.buffer.clear()
-            return
-            
-        if not force and time.time() - self.last_flush < config.FLUSH_INTERVAL:
-            return
-            
-        # Analyze buffer
-        total_samples = len(self.buffer)
-        activity_counts = {}
-        total_fg = 0
-        
-        # --- FIX: Filter out samples with no process name for categorization ---
-        valid_samples = []
-        for sample in self.buffer:
-            (_, proc, _, _, _, _, _) = sample
-            if proc:
-                valid_samples.append(sample)
-                total_fg += 1
+                self.is_paused = False
+                self.pause_start = None
+                self.current_start = datetime.now()  # Reset timing
+                
+                # Feedback
+                self.beep(1500, 150)  # High pitch = resumed
+                self.beep(1500, 150)  # Double beep for resume
+                print("\n" + "=" * 40)
+                print("▶️  TRACKING RESUMED")
+                print("=" * 40 + "\n")
+                logging.info("▶️ TRACKING RESUMED")
+                
+                self.db_writer.queue_event("TRACKING_RESUMED")
+                
+                # Update icon color
+                if self.icon:
+                    self.icon.icon = self.create_icon(config.ICON_COLOR_ACTIVE)
+                
             else:
-                # Still increment total_fg only for samples with a detected process
-                pass 
-        
-        if not valid_samples:
-            logging.warning("Skipping session flush: Buffer contained only samples with no detectable process name.")
-            self.buffer.clear()
-            self.last_flush = time.time()
+                # === PAUSE TRACKING ===
+                self.save_current_activity()  # Save current before pausing
+                
+                self.is_paused = True
+                self.pause_start = datetime.now()
+                
+                # Feedback
+                self.beep(800, 300)  # Low pitch = paused
+                print("\n" + "=" * 40)
+                print("⏸️  TRACKING PAUSED")
+                print("=" * 40 + "\n")
+                logging.info("⏸️ TRACKING PAUSED")
+                
+                self.db_writer.queue_event("TRACKING_PAUSED")
+                
+                # Update icon color
+                if self.icon:
+                    self.icon.icon = self.create_icon(config.ICON_COLOR_PAUSED)
+                
+        except Exception as e:
+            logging.error(f"Toggle pause error: {e}")
+    
+    def get_active_window(self):
+        """Get current active window info - tracks EVERYTHING"""
+        try:
+            hwnd = win32gui.GetForegroundWindow()
+            if hwnd == 0:
+                return None, None
+            
+            window_title = win32gui.GetWindowText(hwnd)
+            if not window_title:
+                return None, None
+            
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            proc = psutil.Process(pid)
+            process_name = proc.name()
+            
+            return process_name, window_title
+            
+        except:
+            return None, None
+    
+    def save_current_activity(self):
+        """Save current activity to database"""
+        if not self.current_process or not self.current_start:
             return
         
-        # Build activity counts ONLY from valid samples
-        for _, proc, proc_lower, title, cat, subcat, score in valid_samples:
-            key = (proc, cat, subcat)
-            if key not in activity_counts:
-                activity_counts[key] = {'count': 0, 'title': title, 'score': score}
-            activity_counts[key]['count'] += 1
-        # --- END FIX ---
+        duration = (datetime.now() - self.current_start).total_seconds()
         
-        # Find dominant activity (We now know winner_proc is NOT None)
-        dominant = max(activity_counts.items(), key=lambda x: x[1]['count'])
-        (winner_proc, winner_cat, winner_subcat), data = dominant
+        if duration < config.MIN_ACTIVITY_DURATION:
+            return
         
-        winner_title = data['title']
-        winner_score = data['score']
-        
-        # Calculate metrics
-        duration = config.FLUSH_INTERVAL
-        # foreground_ratio is calculated based on ALL samples (total_samples), correctly penalizing the session
-        foreground_ratio = total_fg / max(total_samples, 1)
-        foreground_seconds = foreground_ratio * duration
-        
-        # Determine if this is a focus session
-        is_focus = (
-            winner_cat == "PRIMARY_WORK" and
-            duration >= 600 and  # At least 10 minutes
-            foreground_ratio >= 0.8  # 80% active
+        self.db_writer.queue_activity(
+            self.current_start.isoformat(),
+            self.current_process,
+            self.current_window,
+            duration
         )
         
-        # Calculate productivity score
-        productivity = winner_score * foreground_ratio
-        
-        # Save to database
-        try:
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            
-            start_time = (datetime.now() - timedelta(seconds=duration)).isoformat()
-            
-            c.execute("""
-                INSERT INTO sessions 
-                (start_time, end_time, process_name, process_display_name, 
-                 window_title, category, subcategory, duration_seconds, 
-                 foreground_seconds, is_focus_session, productivity_score)
-                VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                start_time,
-                winner_proc,
-                winner_subcat or winner_proc,
-                winner_title,
-                winner_cat,
-                winner_subcat,
-                duration,
-                foreground_seconds,
-                1 if is_focus else 0,
-                productivity
-            ))
-            
-            conn.commit()
-            conn.close()
-            
-            emoji = "🎯" if is_focus else "💻" if winner_cat.startswith("PRIMARY") else "📱" if winner_cat.startswith("SECONDARY") else "🌐"
-            logging.info(
-                f"{emoji} Session: {winner_subcat or winner_proc} | "
-                f"{duration}s | FG: {foreground_seconds:.1f}s | "
-                f"Score: {productivity:.0f}"
-            )
-            
-        except Exception as e:
-            logging.error(f"Failed to save session: {e}")
-            
-        self.buffer.clear()
-        self.last_flush = time.time()
-
-    def check_auto_idle(self):
-        """Check for automatic idle (no activity)"""
-        if self.is_idle or self.is_paused:
-            return
-            
-        idle_duration = time.time() - self.last_activity
-        
-        if idle_duration > config.IDLE_THRESHOLD:
-            self.flush_buffer(force=True)
-            self.is_idle = True
-            self.idle_start = datetime.now() - timedelta(seconds=idle_duration)
-            self.log_idle_period(
-                self.idle_start,
-                datetime.now(),
-                idle_duration,
-                "auto"
-            )
-            logging.info(f"🔴 AUTO-IDLE: No activity for {idle_duration:.0f}s")
-            self.update_icon()
-
-    def monitor_loop(self):
-        """Main monitoring loop"""
-        logging.info("Monitor loop started")
-        
+        logging.debug(f"Activity saved: {self.current_process} | {duration:.1f}s")
+    
+    def process_commands(self):
+        """Process commands from the hotkey manager"""
         while self.monitoring:
             try:
-                # Check for auto-idle
-                self.check_auto_idle()
+                cmd = self.command_queue.get(timeout=0.5)
                 
-                # Skip if idle or paused
-                if self.is_idle or self.is_paused:
-                    time.sleep(5)
+                if cmd == "TOGGLE_PAUSE":
+                    self.toggle_pause()
+                    
+            except Empty:
+                continue
+            except Exception as e:
+                logging.error(f"Command processing error: {e}")
+    
+    def poll_window(self):
+        """Main polling loop for active window - tracks EVERYTHING"""
+        while self.monitoring:
+            try:
+                if self.is_paused:
+                    time.sleep(0.5)
                     continue
-                    
-                # Get current activity
-                proc_name, proc_lower, window_title = self.get_foreground_app()
                 
-                if proc_name:
-                    self.last_activity = time.time()
-                    
-                # Categorize
-                category, subcategory, score = self.categorize_activity(
-                    proc_name, proc_lower, window_title
-                )
+                process_name, window_title = self.get_active_window()
                 
-                # Add to buffer
-                self.buffer.append((
-                    time.time(),
-                    proc_name,
-                    proc_lower,
-                    window_title,
-                    category,
-                    subcategory,
-                    score
-                ))
+                if not process_name:
+                    time.sleep(0.5)
+                    continue
                 
-                # Flush if needed
-                if time.time() - self.last_flush >= config.FLUSH_INTERVAL:
-                    self.flush_buffer()
+                # Check if window changed
+                if process_name != self.current_process or window_title != self.current_window:
+                    # Save previous activity
+                    self.save_current_activity()
                     
-                time.sleep(config.SAMPLE_INTERVAL)
+                    # Start tracking new activity
+                    self.current_process = process_name
+                    self.current_window = window_title
+                    self.current_start = datetime.now()
+                    
+                    logging.debug(f"Window: {process_name} | {window_title[:50]}...")
+                
+                time.sleep(config.POLL_INTERVAL)
                 
             except Exception as e:
-                logging.error(f"Monitor loop error: {e}")
-                time.sleep(5)
-
+                logging.error(f"Polling error: {e}")
+                time.sleep(1)
+    
     def create_icon(self, color):
         """Create system tray icon"""
         img = Image.new("RGB", (64, 64), color)
         d = ImageDraw.Draw(img)
         d.rectangle((12, 12, 52, 52), outline="white", width=4)
         return img
-
-    def update_icon(self):
-        """Update system tray icon"""
-        if not self.icon or not WINDOWS_FEATURES:
-            return
-            
-        if self.is_paused:
-            color = config.ICON_COLOR_PAUSED
-            title = "Tracker: Paused"
-        elif self.is_idle:
-            color = config.ICON_COLOR_IDLE
-            title = "Tracker: Idle"
-        else:
-            color = config.ICON_COLOR_ACTIVE
-            title = "Tracker: Active"
-            
-        self.icon.icon = self.create_icon(color)
-        self.icon.title = title
-
+    
     def quit_app(self, icon=None, item=None):
         """Clean shutdown"""
         logging.info("Shutdown initiated")
         self.monitoring = False
         
-        if self.buffer:
-            self.flush_buffer(force=True)
-            
-        if self.is_idle and self.idle_start:
-            duration = (datetime.now() - self.idle_start).total_seconds()
-            self.log_idle_period(
-                self.idle_start,
-                datetime.now(),
-                duration,
-                "shutdown"
+        # Save any current activity
+        self.save_current_activity()
+        
+        # Save any pending break
+        if self.is_paused and self.pause_start:
+            duration = (datetime.now() - self.pause_start).total_seconds()
+            self.db_writer.queue_break(
+                self.pause_start.isoformat(),
+                datetime.now().isoformat(),
+                duration
             )
-            
-        self.log_system_event("SYSTEM_SHUTDOWN")
+        
+        # Log shutdown event
+        self.db_writer.queue_event("SYSTEM_SHUTDOWN")
+        
+        # Stop components
+        self.hotkey_manager.stop()
+        self.db_writer.stop()
         
         if self.icon:
             self.icon.stop()
-            
+        
         logging.info("Shutdown complete")
         os._exit(0)
-
+    
     def run(self):
         """Start the watcher"""
-        # Start monitoring thread
-        monitor_thread = threading.Thread(target=self.monitor_loop, daemon=True)
-        monitor_thread.start()
+        # Log startup
+        self.db_writer.start()
+        self.db_writer.queue_event("SYSTEM_STARTUP")
         
-        if WINDOWS_FEATURES:
-            # Create system tray icon
-            menu = (
-                item("Idle Mode On", self.start_idle_mode),
-                item("Idle Mode Off", self.end_idle_mode),
-                item("Pause/Resume", self.toggle_monitoring),
-                item("Exit", self.quit_app)
-            )
-            
-            self.icon = pystray.Icon(
-                "ActivityTracker",
-                self.create_icon(config.ICON_COLOR_ACTIVE),
-                "Activity Tracker Pro",
-                menu
-            )
-            
-            self.update_icon()
-            self.icon.run()
-        else:
-            # Console mode (Docker)
-            logging.info("Running in console mode (Docker)")
-            try:
-                while self.monitoring:
-                    time.sleep(10)
-            except KeyboardInterrupt:
-                self.quit_app()
+        # Start hotkey manager
+        self.hotkey_manager.start()
+        
+        # Start command processor thread
+        self.command_thread = threading.Thread(target=self.process_commands, daemon=True, name="CommandThread")
+        self.command_thread.start()
+        
+        # Start polling thread
+        self.polling_thread = threading.Thread(target=self.poll_window, daemon=True, name="PollingThread")
+        self.polling_thread.start()
+        
+        # System tray menu
+        menu = (
+            item("Pause/Resume (Ctrl+Alt+Shift+P)", lambda: self.command_queue.put("TOGGLE_PAUSE")),
+            item("Exit", self.quit_app)
+        )
+        
+        self.icon = pystray.Icon(
+            "ActivityTracker",
+            self.create_icon(config.ICON_COLOR_ACTIVE),
+            "Activity Tracker (Tracking)",
+            menu
+        )
+        
+        print("\n" + "=" * 50)
+        print("🟢 Activity Tracker Running")
+        print("   Press Ctrl+Alt+Shift+P to pause/resume")
+        print("=" * 50 + "\n")
+        
+        # Run system tray (blocks)
+        self.icon.run()
 
 
 if __name__ == "__main__":
-    # Windows startup registration
-    if WINDOWS_FEATURES and sys.platform == "win32":
-        try:
-            import winreg
-            key = winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Run",
-                0,
-                winreg.KEY_SET_VALUE
-            )
-            
-            if getattr(sys, 'frozen', False):
-                path = f'"{sys.executable}"'
-            else:
-                path = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
-                
-            winreg.SetValueEx(key, "ActivityTrackerPro", 0, winreg.REG_SZ, path)
-            winreg.CloseKey(key)
-            logging.info("Startup registration successful")
-        except Exception as e:
-            logging.warning(f"Startup registration failed: {e}")
+    if not WINDOWS_FEATURES:
+        print("Error: Windows-specific libraries required")
+        sys.exit(1)
     
-    # Run watcher
-    watcher = ActivityWatcher()
+    watcher = SimpleActivityWatcher()
     watcher.run()
