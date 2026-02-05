@@ -1,6 +1,7 @@
 """
 Activity Tracker - Simple Dashboard
 Shows: Total Active Time, Break Time, Time per Application
+NEW: Future Outlook with Forecasting
 """
 
 import streamlit as st
@@ -8,11 +9,15 @@ import pandas as pd
 from datetime import datetime, date
 import os
 import logging
+import numpy as np
 
 import config
 from utils.data_loader import DataLoader
 from utils.metrics import MetricsCalculator
 from utils.visualizations import *
+from utils.forecasting import ActivityForecaster
+from utils.visualizations_forecast import *
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -324,6 +329,212 @@ class ActivityDashboard:
             use_container_width=True
         )
     
+    def render_forecast_section(self, df, df_breaks):
+        """Render future forecast section"""
+        st.markdown("---")
+        st.markdown("## 🔮 Future Outlook")
+        st.markdown("*Predictions based on your historical activity patterns*")
+        
+        forecaster = ActivityForecaster(df, df_breaks)
+        
+        # Check if we have enough data
+        daily_totals = forecaster.get_daily_totals()
+        if len(daily_totals) < 3:
+            st.warning("⏳ Need at least 3 days of data for forecasting. Keep tracking!")
+            return
+        
+        # Forecast type selector
+        forecast_type = st.radio(
+            "Select Forecast Horizon",
+            options=['Short-Term', 'Long-Term'],
+            horizontal=True,
+            help="Short-term: Days/Weeks | Long-term: Months"
+        )
+        
+        if forecast_type == 'Short-Term':
+            self._render_short_term_forecast(forecaster)
+        else:
+            self._render_long_term_forecast(forecaster)
+        
+        # Insights section (always shown)
+        self._render_insights(forecaster)
+    
+    def _render_short_term_forecast(self, forecaster):
+        """Render short-term forecast"""
+        st.markdown("### 📊 Short-Term Forecast")
+        
+        # Preset selector
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            preset = st.selectbox(
+                "Forecast Period",
+                options=[3, 7, 14, 30],
+                format_func=lambda x: f"Next {x} days",
+                index=1
+            )
+        
+        result = forecaster.forecast_short_term(days_ahead=preset)
+        
+        if result is None:
+            st.warning("Not enough data for forecasting")
+            return
+        
+        forecast_df, historical_df, stats = result
+        
+        # Summary metrics
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            avg_forecast_active = forecast_df['active_hours'].mean()
+            current_avg = stats['avg_active']
+            change = ((avg_forecast_active - current_avg) / current_avg * 100) if current_avg > 0 else 0
+            
+            st.metric(
+                "Forecast Avg Active",
+                f"{avg_forecast_active:.1f}h/day",
+                f"{change:+.1f}%"
+            )
+        
+        with col2:
+            avg_forecast_break = forecast_df['break_hours'].mean()
+            current_break = stats['avg_break']
+            change_break = ((avg_forecast_break - current_break) / current_break * 100) if current_break > 0 else 0
+            
+            st.metric(
+                "Forecast Avg Break",
+                f"{avg_forecast_break:.1f}h/day",
+                f"{change_break:+.1f}%"
+            )
+        
+        with col3:
+            trend_emoji = "📈" if stats['trend_active'] == 'increasing' else "📉" if stats['trend_active'] == 'decreasing' else "➡️"
+            st.metric(
+                "Activity Trend",
+                stats['trend_active'].title(),
+                f"{trend_emoji}"
+            )
+        
+        # Main forecast chart
+        fig = create_short_term_forecast_chart(forecast_df, historical_df)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Gauges
+        col1, col2 = st.columns(2)
+        with col1:
+            fig_gauge = create_forecast_gauge(
+                current_avg,
+                avg_forecast_active,
+                "Active Hours"
+            )
+            st.plotly_chart(fig_gauge, use_container_width=True)
+        
+        with col2:
+            fig_gauge_break = create_forecast_gauge(
+                current_break,
+                avg_forecast_break,
+                "Break Hours"
+            )
+            st.plotly_chart(fig_gauge_break, use_container_width=True)
+        
+        # App-level forecast
+        st.markdown("#### 📱 Top Applications Forecast")
+        app_forecast = forecaster.get_app_forecast(days_ahead=preset, top_n=5)
+        
+        if app_forecast is not None and not app_forecast.empty:
+            fig_app = create_app_forecast_chart(app_forecast)
+            st.plotly_chart(fig_app, use_container_width=True)
+            
+            # Show trend indicators
+            for _, row in app_forecast.iterrows():
+                trend_icon = "🔺" if row['trend'] == 'increasing' else "🔻" if row['trend'] == 'decreasing' else "➡️"
+                st.caption(f"{trend_icon} **{row['app_name']}**: {row['current_avg']:.1f}h → {row['forecast_avg']:.1f}h")
+    
+    def _render_long_term_forecast(self, forecaster):
+        """Render long-term forecast"""
+        st.markdown("### 📈 Long-Term Forecast")
+        
+        # Preset selector
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            preset = st.selectbox(
+                "Forecast Period",
+                options=[1, 3, 6, 12],
+                format_func=lambda x: f"Next {x} month{'s' if x > 1 else ''}",
+                index=1
+            )
+        
+        result = forecaster.forecast_long_term(months_ahead=preset)
+        
+        if result is None:
+            st.warning("Need at least a week of data for long-term forecasting")
+            return
+        
+        monthly_forecast, weekly_hist, stats = result
+        
+        # Summary metrics
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            total_forecast_active = monthly_forecast['active_hours'].sum()
+            st.metric(
+                f"Total Active ({preset}mo)",
+                f"{total_forecast_active:.0f}h",
+                f"~{total_forecast_active/(preset*30):.1f}h/day"
+            )
+        
+        with col2:
+            total_forecast_break = monthly_forecast['break_hours'].sum()
+            st.metric(
+                f"Total Break ({preset}mo)",
+                f"{total_forecast_break:.0f}h",
+                f"~{total_forecast_break/(preset*30):.1f}h/day"
+            )
+        
+        with col3:
+            trend_emoji = "📈" if stats['trend_active'] == 'increasing' else "📉" if stats['trend_active'] == 'decreasing' else "➡️"
+            st.metric(
+                "Long-Term Trend",
+                stats['trend_active'].title(),
+                f"{trend_emoji}"
+            )
+        
+        # Main forecast chart
+        fig = create_long_term_forecast_chart(monthly_forecast, weekly_hist)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Monthly breakdown table
+        st.markdown("#### 📅 Monthly Forecast Breakdown")
+        display_df = monthly_forecast[['month_name', 'active_hours', 'break_hours', 'total_hours']].copy()
+        display_df.columns = ['Month', 'Active Hours', 'Break Hours', 'Total Hours']
+        
+        st.dataframe(
+            display_df.style.format({
+                'Active Hours': '{:.0f}',
+                'Break Hours': '{:.0f}',
+                'Total Hours': '{:.0f}'
+            }),
+            use_container_width=True
+        )
+    
+    def _render_insights(self, forecaster):
+        """Render AI-generated insights"""
+        st.markdown("---")
+        st.markdown("### 💡 Insights & Recommendations")
+        
+        insights = forecaster.get_insights()
+        
+        if not insights:
+            st.info("Not enough data for insights yet. Keep tracking!")
+            return
+        
+        for insight in insights:
+            if insight['type'] == 'positive':
+                st.success(f"**{insight['title']}**: {insight['message']}")
+            elif insight['type'] == 'warning':
+                st.warning(f"**{insight['title']}**: {insight['message']}")
+            else:
+                st.info(f"**{insight['title']}**: {insight['message']}")
+    
     def render(self):
         """Main render method"""
         self.render_header()
@@ -333,7 +544,7 @@ class ActivityDashboard:
         result = self.load_data(st.session_state.date_range)
         
         if result[0] is None:
-            st.warning("📭 No activity data found for the selected period.")
+            st.warning("🔭 No activity data found for the selected period.")
             st.info("""
 **Getting Started:**
 1. Ensure the Activity Watcher is running (check system tray)
@@ -353,9 +564,12 @@ Press **Ctrl+Alt+Shift+P** to pause/resume tracking.
         self.render_charts(df, metrics_calc, metrics)
         self.render_daily_breakdown(metrics_calc)
         
+        # NEW: Forecast section
+        self.render_forecast_section(df, df_breaks)
+        
         # Footer
         st.markdown("---")
-        st.caption("Activity Tracker | Simple • Raw • No Filters")
+        st.caption("Activity Tracker | Simple • Raw • No Filters • Future Outlook")
 
 
 if __name__ == "__main__":
