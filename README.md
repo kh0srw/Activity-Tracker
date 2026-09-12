@@ -1,399 +1,139 @@
-# Activity Tracker Pro
+# Activity Tracker
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Docker](https://img.shields.io/badge/docker-%230db7ed.svg?style=flat&logo=docker&logoColor=white)](https://www.docker.com/)
-[![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=flat&logo=Streamlit&logoColor=white)](https://streamlit.io/)
+A local-first activity and attention tracker rebuilt in Go for Linux + Hyprland.
 
-**Activity Tracker Pro** is a production-grade activity tracking system designed for productivity enthusiasts. It features intelligent categorization, Docker deployment, and AI-powered insights to help you track smart, work smarter, and live better.
+The tracker has two independent parts:
 
----
+- **Collector** — a tiny background service that listens to Hyprland IPC events and records focused-window spans, workspace changes, raw compositor events, and lightweight system samples.
+- **Dashboard** — an on-demand local web UI. It is **not** kept running; start it only when you want to inspect your data.
 
-## Table of Contents
+No Telegram bot, no Streamlit, no Python runtime, no external database, and no cloud sync.
 
-- [Features](#-features)
-  - [Intelligent Tracking](#intelligent-tracking)
-  - [Advanced Analytics](#advanced-analytics)
-  - [Production Ready](#production-ready)
-  - [AI Insights](#ai-insights)
-- [Architecture](#-architecture)
-- [Quick Start](#-quick-start)
-  - [Prerequisites](#prerequisites)
-  - [Installation](#installation)
-- [Usage](#-usage)
-  - [Keyboard Shortcuts](#keyboard-shortcuts)
-  - [System Tray Icon](#system-tray-icon)
-  - [Dashboard Features](#dashboard-features)
-- [Configuration](#-configuration)
-  - [Watcher Configuration](#watcher-configuration-watcherconfigpy)
-  - [Dashboard Configuration](#dashboard-configuration-dashboardconfigpy)
-- [Database Schema](#-database-schema)
-- [Docker Notes](#-docker-notes)
-- [Productivity Metrics Explained](#-productivity-metrics-explained)
-- [Privacy & Security](#-privacy--security)
-- [Troubleshooting](#-troubleshooting)
-- [Roadmap](#-roadmap)
-- [Contributing](#-contributing)
-- [License](#-license)
-- [Acknowledgments](#-acknowledgments)
-- [Support](#-support)
+## What is tracked
 
----
+Each focus span can include:
 
-## Features
+- start/end time and duration
+- window class/application
+- window title
+- PID
+- workspace id/name
+- monitor id
+- floating/fullscreen state
+- XWayland/native Wayland state
+- Hyprland raw events such as workspace/window/focus changes
+- 1-minute load and memory samples
 
-### Intelligent Tracking
-- **Smart Categorization**: Automatically distinguishes between:
-  - **Primary Work**: VSCode, Cursor, IDEs (highest priority)
-  - **Secondary Work**: Telegram, Slack, Spotify (supportive tools)
-  - **Browser Intelligence**: Detects work vs. leisure domains
-  - **Auto-Idle Detection**: No activity for 5 minutes = automatic idle
+Data stays under `~/.local/share/activity-tracker/` by default. Runtime/control state stays under `~/.local/state/activity-tracker/`.
 
-### Advanced Analytics
-- **Deep Work Sessions**: Tracks focused work periods (10+ min, 80%+ active)
-- **Productivity Scores**: Focus, Efficiency, Time ROI metrics
-- **Activity Heatmaps**: Hour-by-hour, day-by-day patterns
-- **Timeline Views**: Visual session history
-- **Streak Tracking**: Consecutive productive days
+## Analytics
 
-### Production Ready
-- **Dockerized Architecture**: Container-based deployment
-- **Persistent Storage**: Database survives restarts
-- **Health Checks**: Automatic service monitoring
-- **Optimized Performance**: Handles months of data efficiently
+The dashboard/report engine computes metrics intended to describe attention quality, not just screen time:
 
-### AI Insights
-- **Gemini Integration**: AI-powered productivity analysis
-- **Actionable Recommendations**: Data-driven improvement suggestions
-- **Trend Analysis**: Pattern recognition and forecasting
+- tracked time and elapsed workday span
+- active density
+- context switches and switches/hour
+- short-focus fragmentation score
+- focus score
+- median and longest focus span
+- 25+ minute same-app flow blocks and deep-work share
+- bounce-back rate (`A → B → A` within two minutes)
+- application entropy (how scattered usage is)
+- per-workspace allocation
+- hourly activity distribution
+- daily breakdown and 7-day trend
+- routine consistency
+- top window contexts/titles
+- local CSV export
 
-[Back to Top](#-table-of-contents)
+These are behavioral heuristics, not medical or psychological measurements.
 
----
-
-## Architecture
-
-The system is built with a modular architecture ensuring reliability and scalability:
-
-```
-activity-tracker-pro/
-├── watcher/          # Background monitoring service (Windows Native)
-├── dashboard/        # Streamlit analytics interface (Dockerized)
-├── shared/           # Database initialization
-└── data/             # Persistent SQLite storage
-```
-
-[Back to Top](#-table-of-contents)
-
----
-
-## Quick Start
-
-### Prerequisites
-- **Windows 10/11** (Required for Watcher - needs GUI access)
-- **Docker Desktop** (Recommended for Dashboard)
-- **Python 3.11+** (For local Watcher execution)
-
-### Installation
-
-1.  **Clone the repository**
-    ```bash
-    git clone https://github.com/aliasghar5642/Activity-Tracker.git
-    cd Activity-Tracker
-    ```
-
-2.  **Configure environment**
-    ```bash
-    cp .env.example .env
-    # Edit .env and add your GEMINI_API_KEY (optional)
-    ```
-
-3.  **Start the system**
-
-    #### Option A: Windows Native Watcher + Docker Dashboard (Recommended)
-
-    **Terminal 1: Run Watcher on Windows**
-    ```bash
-    cd watcher
-    pip install -r requirements.txt
-    python watcher.py
-    ```
-
-    **Terminal 2: Run Dashboard in Docker**
-    ```bash
-    docker-compose up dashboard
-    ```
-
-    #### Option B: Everything on Windows (No Docker)
-
-    **Terminal 1: Watcher**
-    ```bash
-    cd watcher
-    pip install -r requirements.txt
-    python watcher.py
-    ```
-
-    **Terminal 2: Dashboard**
-    ```bash
-    cd dashboard
-    pip install -r requirements.txt
-    streamlit run app.py
-    ```
-
-4.  **Access Dashboard**
-    Open your browser and navigate to: [http://localhost:8501](http://localhost:8501)
-
-[Back to Top](#-table-of-contents)
-
----
-
-## Usage
-
-### Keyboard Shortcuts
-| Shortcut | Action |
-|----------|--------|
-| `Ctrl+Alt+Shift+I` | Start manual idle mode |
-| `Ctrl+Alt+Shift+O` | End idle mode |
-| `Ctrl+Alt+Shift+P` | Pause/Resume tracking |
-
-### System Tray Icon
-- 🟢 **Green**: Actively tracking
-- 🔴 **Red**: Idle mode
-- ⚪ **Gray**: Paused
-
-### Dashboard Features
-1.  **Time Period Selector**: View last 1-90 days
-2.  **Real-time Metrics**: KPIs update every 30 seconds
-3.  **Interactive Charts**: Hover for detailed info
-4.  **AI Analysis**: Click "Generate AI Analysis" for insights
-5.  **Data Export**: Download detailed breakdowns
-
-[Back to Top](#-table-of-contents)
-
----
-
-## 🔧 Configuration
-
-### Watcher Configuration (`watcher/config.py`)
-
-```python
-# Sample interval
-SAMPLE_INTERVAL = 1  # seconds
-
-# Session creation interval
-FLUSH_INTERVAL = 30  # seconds
-
-# Auto-idle threshold
-IDLE_THRESHOLD = 300  # 5 minutes
-
-# Customize application categories
-PRIMARY_WORK_APPS = {
-    "code.exe": "VSCode",
-    "cursor.exe": "Cursor",
-    # Add your apps here
-}
-
-# Customize work domains
-WORK_DOMAINS = [
-    "github.com",
-    "stackoverflow.com",
-    # Add your domains here
-]
-```
-
-### Dashboard Configuration (`dashboard/config.py`)
-
-```python
-# Default date range
-DEFAULT_DATE_RANGE = 7  # days
-
-# Focus session thresholds
-FOCUS_SESSION_MIN_DURATION = 600  # 10 minutes
-FOCUS_SESSION_MIN_FOREGROUND = 0.8  # 80% active
-
-# Productivity score thresholds
-EXCELLENT_SCORE = 85
-GOOD_SCORE = 70
-MEDIUM_SCORE = 50
-```
-
-[Back to Top](#-table-of-contents)
-
----
-
-## Database Schema
-
-### Sessions Table
-- **Tracks**: Every 30-second window
-- **Categories**: `PRIMARY_WORK`, `SECONDARY_WORK`, `BROWSER_WORK`, `BROWSER_NONWORK`, `IDLE`
-- **Metrics**: Duration, foreground time, productivity score, focus session flag
-
-### Idle Periods Table
-- **Tracks**: Manual and automatic idle periods
-- **Reason**: Manual, auto, shutdown
-
-### System Events Table
-- **Logs**: Startup, shutdown, pause, resume events
-
-[Back to Top](#-table-of-contents)
-
----
-
-## Docker Notes
-
-### Why Watcher Runs on Host
-Docker containers **cannot access Windows GUI APIs** (pygetwindow, keyboard). The watcher must run natively on Windows to:
-- Detect active window titles
-- Capture keyboard shortcuts
-- Show system tray icon
-
-The dashboard runs perfectly in Docker as it only needs database access.
-
-### Docker Commands
+## Build on Ubuntu
 
 ```bash
-# Start dashboard only
-docker-compose up dashboard
-
-# View logs
-docker-compose logs -f dashboard
-
-# Rebuild after changes
-docker-compose up --build dashboard
-
-# Stop services
-docker-compose down
+git clone -b kh0srw https://github.com/kh0srw/Activity-Tracker.git
+cd Activity-Tracker
+go test ./...
+go build -trimpath -ldflags="-s -w" -o activity-tracker ./cmd/activity-tracker
 ```
 
-[Back to Top](#-table-of-contents)
+Go 1.23+ is recommended.
 
----
+## Install the collector
 
-## Productivity Metrics Explained
+```bash
+./activity-tracker install
+```
 
-### Focus Score (0-100)
-Measures concentration quality:
-- **85-100**: Excellent - Deep work dominates
-- **70-84**: Good - Solid focus with minor distractions
-- **50-69**: Medium - Fragmented attention
-- **0-49**: Poor - High distraction level
+This copies the binary to `~/.local/bin/activity-tracker`, creates a user-level systemd service, and starts it.
 
-**Formula**: `(Primary Work Ratio × 60) + (Focus Quality × 40)`
+Check it:
 
-### Efficiency Score (0-100)
-Percentage of tracked time spent on work:
-- **Work** = `PRIMARY_WORK` + `SECONDARY_WORK` + `BROWSER_WORK`
-- **Formula**: `(Work Time / Total Time) × 100`
+```bash
+~/.local/bin/activity-tracker status
+systemctl --user status activity-tracker.service
+journalctl --user -u activity-tracker.service -f
+```
 
-### Time ROI (0-300+)
-Value generated per minute tracked:
-- **Primary Work**: 3x multiplier
-- **Browser Work**: 1x multiplier
-- **Secondary Work**: 0.8x multiplier
-- **Formula**: `(Weighted Value / Total Time) × 100`
+The collector connects directly to Hyprland IPC. It can discover the current Hyprland runtime socket even when `HYPRLAND_INSTANCE_SIGNATURE` is not inherited by systemd.
 
-### Deep Work Sessions
-Continuous `PRIMARY_WORK` periods with:
-- Duration ≥ 10 minutes
-- Foreground ratio ≥ 80%
-- Minimal context switches
+## Open the dashboard only when needed
 
-[Back to Top](#-table-of-contents)
+```bash
+~/.local/bin/activity-tracker dashboard --days 7
+```
 
----
+It starts only on `127.0.0.1:8787` and opens your browser. Stop it with `Ctrl+C`.
 
-## Privacy & Security
+Other examples:
 
-- **Local Data**: All data stays local in a SQLite database on your machine.
-- **No Telemetry**: Zero data leaves your system (except AI API calls).
-- **Gemini API**: Only sends aggregated metrics, not raw data.
-- **Open Source**: Audit the code yourself.
+```bash
+activity-tracker dashboard --days 30
+activity-tracker dashboard --days 14 --no-open
+activity-tracker report --days 7
+activity-tracker status
+activity-tracker prune --keep-days 120
+```
 
-[Back to Top](#-table-of-contents)
+## Pause/resume tracking
 
----
+```bash
+activity-tracker pause
+activity-tracker resume
+activity-tracker toggle
+```
 
-## Troubleshooting
+Optional Hyprland bind for 0.55+ Lua config:
 
-### Watcher Issues
+```lua
+hl.bind("SUPER + SHIFT + P", hl.dsp.exec_cmd("~/.local/bin/activity-tracker toggle"))
+```
 
-**Problem**: Hotkeys not working
-- **Solution**: Run as administrator.
+For Hyprland 0.54 and older hyprlang configs:
 
-**Problem**: No data recorded
-- **Solution**: Check logs in `~/ActivityTracker/logs/watcher.log`.
+```ini
+bind = SUPER SHIFT, P, exec, ~/.local/bin/activity-tracker toggle
+```
 
-**Problem**: High CPU usage
-- **Solution**: Increase `SAMPLE_INTERVAL` in config.
+## Export
 
-### Dashboard Issues
+While the dashboard is running:
 
-**Problem**: Database not found
-- **Solution**: Ensure watcher has run for at least 30 seconds.
+- open `http://127.0.0.1:8787/export.csv?days=7`
+- or use the **Export CSV** button
 
-**Problem**: Charts not loading
-- **Solution**: Wait for more data (minimum 1 hour recommended).
+Raw append-only files are also human-readable JSONL under:
 
-**Problem**: AI insights unavailable
-- **Solution**: Add `GEMINI_API_KEY` to `.env` file.
+```text
+~/.local/share/activity-tracker/events/YYYY-MM-DD.jsonl
+```
 
-[Back to Top](#-table-of-contents)
+## Privacy
 
----
+Window titles can contain document names, browser page titles, chats, or other sensitive context. This project stores them locally because they are useful for detailed analysis. Do not sync the data directory to a public location unless that is intentional.
 
-## Roadmap
+The collector does **not** record keystrokes, clipboard contents, screenshots, or network traffic.
 
-- [ ] Web-based configuration UI
-- [ ] Export reports to PDF
-- [ ] Integration with Google Calendar
-- [ ] Mobile companion app
-- [ ] Team analytics (multi-user)
-- [ ] Browser extension
-- [ ] Pomodoro timer integration
+## Security note
 
-[Back to Top](#-table-of-contents)
-
----
-
-## Contributing
-
-Contributions are welcome! Please follow these steps:
-1.  Fork the repository.
-2.  Create a feature branch (`git checkout -b feature/AmazingFeature`).
-3.  Commit your changes (`git commit -m 'Add some AmazingFeature'`).
-4.  Push to the branch (`git push origin feature/AmazingFeature`).
-5.  Open a Pull Request.
-
-[Back to Top](#-table-of-contents)
-
----
-
-## License
-
-Distributed under the MIT License. See `LICENSE` for more information.
-
-[Back to Top](#-table-of-contents)
-
----
-
-## Acknowledgments
-
-- [Streamlit](https://streamlit.io/) for the amazing dashboard framework.
-- [Plotly](https://plotly.com/) for interactive visualizations.
-- [Google Gemini](https://deepmind.google/technologies/gemini/) for AI capabilities.
-
-[Back to Top](#-table-of-contents)
-
----
-
-## Support
-
-- **Issues**: [GitHub Issues](https://github.com/aliasghar5642/Activity-Tracker/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/aliasghar5642/Activity-Tracker/discussions)
-- **LinkedIn**: [LinkedIn Account](https://www.linkedin.com/in/aliasgharbagheri/)
-
----
-
-**Built with ❤️ for productivity enthusiasts**
-
-*Track smart. Work smarter. Live better.*
+The old Python implementation contained a Telegram bot token in repository history. The bot has been removed from the current codebase. A token that has ever been committed to a public repository must still be considered compromised and should be revoked/regenerated in BotFather; making the repository private later does not make the old token safe.
