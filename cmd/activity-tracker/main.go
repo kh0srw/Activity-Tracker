@@ -21,7 +21,14 @@ import (
 	"github.com/kh0srw/Activity-Tracker/internal/store"
 )
 
-const version = "2.0.0"
+const version = "2.1.0"
+
+type waybarOutput struct {
+	Text    string `json:"text"`
+	Alt     string `json:"alt"`
+	Tooltip string `json:"tooltip"`
+	Class   string `json:"class"`
+}
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -60,6 +67,8 @@ func main() {
 		}
 	case "status":
 		fmt.Println(collector.RuntimeSummary(paths))
+	case "waybar":
+		err = runWaybar(paths)
 	case "install":
 		err = install(paths)
 	case "uninstall":
@@ -88,6 +97,7 @@ Usage:
   activity-tracker report [--days 7]      print JSON analytics
   activity-tracker pause|resume|toggle     control collection without stopping service
   activity-tracker status                  show live collector state
+  activity-tracker waybar                  print Waybar-compatible JSON status
   activity-tracker install                 install binary + user systemd service
   activity-tracker uninstall               remove user systemd service
   activity-tracker prune --keep-days 90    delete old daily event files
@@ -151,6 +161,51 @@ func runReport(paths config.Paths, args []string) error {
 	b, _ := json.MarshalIndent(s, "", "  ")
 	fmt.Println(string(b))
 	return nil
+}
+
+func runWaybar(paths config.Paths) error {
+	st, err := collector.ReadRuntime(paths)
+	out := waybarOutput{}
+
+	if err != nil || st.LastSeen.IsZero() || time.Since(st.LastSeen) >= 30*time.Second {
+		out.Text = "× OFF"
+		out.Alt = "offline"
+		out.Class = "offline"
+		out.Tooltip = "Activity Tracker\rCollector is not responding"
+		return json.NewEncoder(os.Stdout).Encode(out)
+	}
+
+	if collector.IsPaused(paths) {
+		out.Text = "Ⅱ PAUSED"
+		out.Alt = "paused"
+		out.Class = "paused"
+		out.Tooltip = fmt.Sprintf("Activity Tracker: paused\rCollector PID: %d\rLast seen: %s", st.PID, st.LastSeen.Local().Format("15:04:05"))
+		return json.NewEncoder(os.Stdout).Encode(out)
+	}
+
+	app := "unknown"
+	workspace := "-"
+	title := ""
+	if st.Window != nil {
+		if st.Window.Class != "" {
+			app = st.Window.Class
+		}
+		if st.Window.Workspace.Name != "" {
+			workspace = st.Window.Workspace.Name
+		} else if st.Window.Workspace.ID != 0 {
+			workspace = fmt.Sprintf("%d", st.Window.Workspace.ID)
+		}
+		title = st.Window.Title
+	}
+
+	out.Text = "● TRACK"
+	out.Alt = "tracking"
+	out.Class = "tracking"
+	out.Tooltip = fmt.Sprintf("Activity Tracker: tracking\rApp: %s\rWorkspace: %s", app, workspace)
+	if title != "" {
+		out.Tooltip += "\rWindow: " + title
+	}
+	return json.NewEncoder(os.Stdout).Encode(out)
 }
 
 func runPrune(paths config.Paths, args []string) error {
