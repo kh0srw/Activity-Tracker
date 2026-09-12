@@ -181,6 +181,10 @@ func readBootID() string {
 }
 func fileExists(path string) bool { _, err := os.Stat(path); return err == nil }
 
+func IsPaused(paths config.Paths) bool {
+	return fileExists(paths.PauseFile)
+}
+
 func SetPaused(paths config.Paths, paused bool) error {
 	if err := config.Ensure(paths); err != nil {
 		return err
@@ -219,7 +223,7 @@ func RuntimeSummary(paths config.Paths) string {
 	if st.Window != nil {
 		app, title, ws = st.Window.Class, st.Window.Title, st.Window.Workspace.Name
 	}
-	return fmt.Sprintf("collector_alive=%t paused=%t pid=%d last_seen=%s app=%q workspace=%q title=%q", alive, st.Paused, st.PID, st.LastSeen.Format(time.RFC3339), app, ws, title)
+	return fmt.Sprintf("collector_alive=%t paused=%t pid=%d last_seen=%s app=%q workspace=%q title=%q", alive, IsPaused(paths), st.PID, st.LastSeen.Format(time.RFC3339), app, ws, title)
 }
 
 func InstalledBinaryPath() string {
