@@ -83,8 +83,8 @@ func Analyze(spans []model.Record, since time.Time, now time.Time) Summary {
 	hourSec := make([]float64, 24)
 	hourSwitch := make([]int, 24)
 	type dayAgg struct {
-		sec, deep  float64
-		switches   int
+		sec, deep   float64
+		switches    int
 		first, last time.Time
 	}
 	days := map[string]*dayAgg{}
@@ -239,6 +239,7 @@ func mergeRuns(spans []model.Record, since, now time.Time) []run {
 		}
 		out = append(out, run{start: st, end: en, app: app, workspace: ws, seconds: sec})
 	}
+	// Correct exact duration after merges, avoiding double counting gaps.
 	for i := range out {
 		out[i].seconds = out[i].end.Sub(out[i].start).Seconds()
 	}
