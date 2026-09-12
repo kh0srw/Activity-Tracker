@@ -1,0 +1,8 @@
+"custom/activity-tracker": {
+  "exec": "~/.local/bin/activity-tracker waybar",
+  "return-type": "json",
+  "interval": 2,
+  "tooltip": true,
+  "on-click": "~/.local/bin/activity-tracker toggle",
+  "on-click-right": "sh -c 'setsid -f ~/.local/bin/activity-tracker dashboard --days 30 >/dev/null 2>&1'"
+}
