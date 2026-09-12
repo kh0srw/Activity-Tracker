@@ -1,0 +1,16 @@
+#custom-activity-tracker {
+  padding: 0 8px;
+  margin: 0 3px;
+}
+
+#custom-activity-tracker.tracking {
+  color: #7ee787;
+}
+
+#custom-activity-tracker.paused {
+  color: #e3b341;
+}
+
+#custom-activity-tracker.offline {
+  color: #f85149;
+}
